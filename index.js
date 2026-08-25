@@ -17,6 +17,34 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 let sock;
 let currentQR = '';
 
+// Extraer número de teléfono real resolviendo el LID de WhatsApp
+function extractRealPhoneNumber(msg) {
+  const remoteJid = msg.key.remoteJid || '';
+  
+  // Ignorar grupos y difusiones/estados
+  if (remoteJid.includes('@g.us') || remoteJid.includes('@broadcast') || remoteJid === 'status@broadcast') {
+    return null;
+  }
+
+  // 1. WhatsApp envía el número real en senderPn cuando usa LID
+  let rawPn = msg.key.senderPn || msg.senderPn || msg.key.participantPn;
+
+  // 2. Si no viene senderPn pero el remoteJid es el formato clásico
+  if (!rawPn && remoteJid.endsWith('@s.whatsapp.net')) {
+    rawPn = remoteJid;
+  }
+
+  // 3. Fallback
+  if (!rawPn) {
+    rawPn = remoteJid;
+  }
+
+  const cleanDigits = rawPn.split('@')[0].replace(/[^0-9]/g, '');
+  if (!cleanDigits) return null;
+
+  return '+' + cleanDigits;
+}
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
@@ -52,20 +80,32 @@ async function connectToWhatsApp() {
 
     for (const msg of messages) {
       if (!msg.key.fromMe && msg.message) {
-        const phone = '+' + msg.key.remoteJid.split('@')[0];
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        const phone = extractRealPhoneNumber(msg);
+        if (!phone) continue; // Si es grupo o estado, ignorar
+
+        const text = msg.message.conversation || 
+                     msg.message.extendedTextMessage?.text || 
+                     (msg.message.imageMessage ? '📷 Imagen recibida' : '');
+        
         const name = msg.pushName || phone;
 
         if (!text) continue;
 
-        // 1. Buscar o crear contacto en Supabase
+        // 1. Buscar contacto por número exacto o por últimos 8 dígitos (evita duplicados por prefijo)
         let { data: contact } = await supabase
           .from('contacts')
           .select('*')
           .eq('phone', phone)
-          .single();
+          .maybeSingle();
 
         if (!contact) {
+          const last8 = phone.slice(-8);
+          const { data: allContacts } = await supabase.from('contacts').select('*');
+          contact = allContacts?.find(c => c.phone && c.phone.replace(/[^0-9]/g, '').endsWith(last8));
+        }
+
+        if (!contact) {
+          // Si es un contacto totalmente nuevo, crearlo en ENTRANTE
           const { data: newContact } = await supabase
             .from('contacts')
             .insert([{ name, phone, status: 'entrante', last_message: text }])
@@ -73,13 +113,18 @@ async function connectToWhatsApp() {
             .single();
           contact = newContact;
         } else {
+          // Si ya existe, actualizar su último mensaje sin moverlo de columna
           await supabase
             .from('contacts')
-            .update({ last_message: text, updated_at: new Date().toISOString() })
+            .update({ 
+              last_message: text, 
+              name: (contact.name === contact.phone || !contact.name) ? name : contact.name,
+              updated_at: new Date().toISOString() 
+            })
             .eq('id', contact.id);
         }
 
-        // 2. Guardar mensaje en la tabla messages
+        // 2. Guardar mensaje en la conversación
         if (contact) {
           await supabase.from('messages').insert([{
             contact_id: contact.id,
@@ -108,7 +153,7 @@ app.get('/qr', (req, res) => {
   </div>`);
 });
 
-// Endpoint para enviar mensajes desde tu CRM
+// Endpoint para enviar mensajes e imágenes desde tu CRM
 app.post('/send-message', async (req, res) => {
   const { phone, message, imageUrl } = req.body;
   if (!phone || !sock) {
@@ -118,14 +163,12 @@ app.post('/send-message', async (req, res) => {
   try {
     const formattedPhone = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
     
-    // Si viene una imagen, manda la foto a WhatsApp con el texto como pie de foto
     if (imageUrl) {
       await sock.sendMessage(formattedPhone, { 
         image: { url: imageUrl }, 
         caption: message || '' 
       });
     } else {
-      // Si no hay imagen, manda solo el texto tradicional
       await sock.sendMessage(formattedPhone, { text: message });
     }
 
