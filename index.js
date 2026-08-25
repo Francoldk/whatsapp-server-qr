@@ -110,14 +110,25 @@ app.get('/qr', (req, res) => {
 
 // Endpoint para enviar mensajes desde tu CRM
 app.post('/send-message', async (req, res) => {
-  const { phone, message } = req.body;
-  if (!phone || !message || !sock) {
+  const { phone, message, imageUrl } = req.body;
+  if (!phone || !sock) {
     return res.status(400).json({ error: 'Faltan parámetros o socket no listo' });
   }
 
   try {
     const formattedPhone = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-    await sock.sendMessage(formattedPhone, { text: message });
+    
+    // Si viene una imagen, manda la foto a WhatsApp con el texto como pie de foto
+    if (imageUrl) {
+      await sock.sendMessage(formattedPhone, { 
+        image: { url: imageUrl }, 
+        caption: message || '' 
+      });
+    } else {
+      // Si no hay imagen, manda solo el texto tradicional
+      await sock.sendMessage(formattedPhone, { text: message });
+    }
+
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
