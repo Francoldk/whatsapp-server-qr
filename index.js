@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const pino = require('pino');
 
@@ -9,7 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Conexión a Supabase
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -17,36 +16,80 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 let sock;
 let currentQR = '';
 
-// Extraer número de teléfono real resolviendo el LID de WhatsApp
-function extractRealPhoneNumber(msg) {
-  const remoteJid = msg.key.remoteJid || '';
-  
-  // Ignorar grupos y difusiones/estados
-  if (remoteJid.includes('@g.us') || remoteJid.includes('@broadcast') || remoteJid === 'status@broadcast') {
-    return null;
-  }
+// Adaptador de Baileys para almacenar la sesión en Supabase
+async function useSupabaseAuthState() {
+  const readData = async (key) => {
+    try {
+      const { data, error } = await supabase
+        .from('whatsapp_auth')
+        .select('value')
+        .eq('key', key)
+        .maybeSingle();
 
-  // 1. WhatsApp envía el número real en senderPn cuando usa LID
-  let rawPn = msg.key.senderPn || msg.senderPn || msg.key.participantPn;
+      if (error || !data) return null;
+      return JSON.parse(JSON.stringify(data.value), BufferJSON.reviver);
+    } catch (error) {
+      return null;
+    }
+  };
 
-  // 2. Si no viene senderPn pero el remoteJid es el formato clásico
-  if (!rawPn && remoteJid.endsWith('@s.whatsapp.net')) {
-    rawPn = remoteJid;
-  }
+  const writeData = async (key, value) => {
+    try {
+      const parsedValue = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+      await supabase
+        .from('whatsapp_auth')
+        .upsert({ key, value: parsedValue }, { onConflict: 'key' });
+    } catch (error) {
+      console.error('Error guardando en Supabase auth:', error);
+    }
+  };
 
-  // 3. Fallback
-  if (!rawPn) {
-    rawPn = remoteJid;
-  }
+  const removeData = async (key) => {
+    try {
+      await supabase.from('whatsapp_auth').delete().eq('key', key);
+    } catch (error) {
+      console.error('Error eliminando de Supabase auth:', error);
+    }
+  };
 
-  const cleanDigits = rawPn.split('@')[0].replace(/[^0-9]/g, '');
-  if (!cleanDigits) return null;
+  const creds = (await readData('creds')) || initAuthCreds();
 
-  return '+' + cleanDigits;
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }
+          return data;
+        },
+        set: async (data) => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              if (value) {
+                await writeData(key, value);
+              } else {
+                await removeData(key);
+              }
+            }
+          }
+        }
+      }
+    },
+    saveCreds: () => writeData('creds', creds)
+  };
 }
 
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  const { state, saveCreds } = await useSupabaseAuthState();
 
   sock = makeWASocket({
     auth: state,
@@ -59,9 +102,7 @@ async function connectToWhatsApp() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      currentQR = await QRCode.toDataURL(qr);
-    }
+    if (qr) currentQR = await QRCode.toDataURL(qr);
 
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
@@ -69,7 +110,7 @@ async function connectToWhatsApp() {
         connectToWhatsApp();
       }
     } else if (connection === 'open') {
-      console.log('✅ WhatsApp Conectado exitosamente');
+      console.log('✅ WhatsApp Conectado exitosamente y persistido en BD');
       currentQR = 'CONNECTED';
     }
   });
@@ -80,51 +121,52 @@ async function connectToWhatsApp() {
 
     for (const msg of messages) {
       if (!msg.key.fromMe && msg.message) {
-        const phone = extractRealPhoneNumber(msg);
-        if (!phone) continue; // Si es grupo o estado, ignorar
+        const rawJid = msg.key.remoteJid || '';
+        
+        if (rawJid.includes('@g.us') || rawJid.includes('@broadcast') || rawJid === 'status@broadcast') {
+          continue;
+        }
 
         const text = msg.message.conversation || 
                      msg.message.extendedTextMessage?.text || 
                      (msg.message.imageMessage ? '📷 Imagen recibida' : '');
         
-        const name = msg.pushName || phone;
-
         if (!text) continue;
 
-        // 1. Buscar contacto por número exacto o por últimos 8 dígitos (evita duplicados por prefijo)
+        const name = msg.pushName || (rawJid.endsWith('@s.whatsapp.net') ? '+' + rawJid.split('@')[0] : 'Contacto WhatsApp');
+        const displayPhone = rawJid.endsWith('@s.whatsapp.net') ? '+' + rawJid.split('@')[0] : name;
+
         let { data: contact } = await supabase
           .from('contacts')
           .select('*')
-          .eq('phone', phone)
+          .or(`jid.eq.${rawJid},phone.eq.${displayPhone}`)
           .maybeSingle();
 
         if (!contact) {
-          const last8 = phone.slice(-8);
-          const { data: allContacts } = await supabase.from('contacts').select('*');
-          contact = allContacts?.find(c => c.phone && c.phone.replace(/[^0-9]/g, '').endsWith(last8));
-        }
-
-        if (!contact) {
-          // Si es un contacto totalmente nuevo, crearlo en ENTRANTE
           const { data: newContact } = await supabase
             .from('contacts')
-            .insert([{ name, phone, status: 'entrante', last_message: text }])
+            .insert([{ 
+              name: msg.pushName || displayPhone, 
+              phone: displayPhone, 
+              jid: rawJid,
+              status: 'entrante', 
+              last_message: text 
+            }])
             .select()
             .single();
           contact = newContact;
         } else {
-          // Si ya existe, actualizar su último mensaje sin moverlo de columna
           await supabase
             .from('contacts')
             .update({ 
-              last_message: text, 
+              last_message: text,
+              jid: rawJid,
               name: (contact.name === contact.phone || !contact.name) ? name : contact.name,
               updated_at: new Date().toISOString() 
             })
             .eq('id', contact.id);
         }
 
-        // 2. Guardar mensaje en la conversación
         if (contact) {
           await supabase.from('messages').insert([{
             contact_id: contact.id,
@@ -139,41 +181,40 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// Endpoint para ver el QR en el navegador
 app.get('/qr', (req, res) => {
-  if (currentQR === 'CONNECTED') {
-    return res.send('<h2>✅ WhatsApp ya está conectado</h2>');
-  }
-  if (!currentQR) {
-    return res.send('<h2>Generando QR, recarga en unos segundos...</h2>');
-  }
+  if (currentQR === 'CONNECTED') return res.send('<h2>✅ WhatsApp ya está conectado</h2>');
+  if (!currentQR) return res.send('<h2>Generando QR, recarga en unos segundos...</h2>');
   res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
     <h2>Escaneá con tu WhatsApp</h2>
     <img src="${currentQR}" style="width:300px;height:300px;"/>
   </div>`);
 });
 
-// Endpoint para enviar mensajes e imágenes desde tu CRM
 app.post('/send-message', async (req, res) => {
-  const { phone, message, imageUrl } = req.body;
-  if (!phone || !sock) {
+  const { phone, jid, message, imageUrl } = req.body;
+  if ((!phone && !jid) || !sock) {
     return res.status(400).json({ error: 'Faltan parámetros o socket no listo' });
   }
 
   try {
-    const formattedPhone = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-    
+    let targetJid = jid;
+    if (!targetJid) {
+      const cleanDigits = phone.replace(/[^0-9]/g, '');
+      targetJid = `${cleanDigits}@s.whatsapp.net`;
+    }
+
     if (imageUrl) {
-      await sock.sendMessage(formattedPhone, { 
+      await sock.sendMessage(targetJid, { 
         image: { url: imageUrl }, 
         caption: message || '' 
       });
     } else {
-      await sock.sendMessage(formattedPhone, { text: message });
+      await sock.sendMessage(targetJid, { text: message });
     }
 
     res.json({ success: true });
   } catch (error) {
+    console.error('Error enviando:', error);
     res.status(500).json({ error: error.message });
   }
 });
