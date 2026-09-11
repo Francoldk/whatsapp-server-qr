@@ -13,6 +13,9 @@ const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.su
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL || 'https://crm-dcam-produccion.vercel.app/api/whatsapp-webhook';
+const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-dcam-produccion.vercel.app/api/ai-extract';
+
 let sock;
 let currentQR = '';
 
@@ -88,6 +91,20 @@ async function useSupabaseAuthState() {
   };
 }
 
+async function askSolAI(conversationHistory) {
+  try {
+    const res = await fetch(AI_EXTRACT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationHistory })
+    });
+    return await res.json();
+  } catch (err) {
+    console.error('Error llamando a Sol AI:', err.message);
+    return null;
+  }
+}
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useSupabaseAuthState();
 
@@ -115,7 +132,7 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Escuchar mensajes entrantes
+  // Escuchar mensajes entrantes y despachar al CRM + Sol
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -129,13 +146,16 @@ async function connectToWhatsApp() {
 
         const text = msg.message.conversation || 
                      msg.message.extendedTextMessage?.text || 
-                     (msg.message.imageMessage ? '📷 Imagen recibida' : '');
+                     (msg.message.imageMessage ? '📷 Imagen recibida' : '') ||
+                     (msg.message.documentMessage ? `📄 Documento PDF: ${msg.message.documentMessage.fileName || 'archivo.pdf'}` : '');
         
         if (!text) continue;
 
-        const name = msg.pushName || (rawJid.endsWith('@s.whatsapp.net') ? '+' + rawJid.split('@')[0] : 'Contacto WhatsApp');
-        const displayPhone = rawJid.endsWith('@s.whatsapp.net') ? '+' + rawJid.split('@')[0] : name;
+        const cleanPhone = rawJid.replace(/\D/g, '');
+        const name = msg.pushName || `+${cleanPhone}`;
+        const displayPhone = `+${cleanPhone}`;
 
+        // 1. Persistencia en Supabase
         let { data: contact } = await supabase
           .from('contacts')
           .select('*')
@@ -146,7 +166,7 @@ async function connectToWhatsApp() {
           const { data: newContact } = await supabase
             .from('contacts')
             .insert([{ 
-              name: msg.pushName || displayPhone, 
+              name, 
               phone: displayPhone, 
               jid: rawJid,
               status: 'entrante', 
@@ -174,12 +194,63 @@ async function connectToWhatsApp() {
             text: text
           }]);
         }
+
+        // 2. Notificar al CRM en Vercel
+        try {
+          const crmRes = await fetch(CRM_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: cleanPhone, name, text, sender: 'client' })
+          });
+          const crmData = await crmRes.json();
+          const conv = crmData?.conversation;
+
+          // Si Sol está en pausa en el CRM, no responde
+          if (conv && conv.botActive === false) {
+            console.log(`Sol en pausa para ${name}`);
+            continue;
+          }
+
+          // 3. Respuesta automática con Sol AI
+          const history = conv?.messages?.length ? conv.messages : [{ sender: 'client', text }];
+          const aiData = await askSolAI(history);
+
+          if (aiData?.replyMessage) {
+            // Responder por WhatsApp
+            await sock.sendMessage(rawJid, { text: aiData.replyMessage });
+
+            // Registrar en Supabase
+            if (contact) {
+              await supabase.from('messages').insert([{
+                contact_id: contact.id,
+                sender: 'me',
+                text: aiData.replyMessage
+              }]);
+            }
+
+            // Registrar respuesta y ficha técnica en el CRM
+            await fetch(CRM_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                phone: cleanPhone,
+                text: aiData.replyMessage,
+                sender: 'me',
+                extractedData: aiData.extractedData || null
+              })
+            });
+          }
+        } catch (crmErr) {
+          console.error('Error enviando al CRM:', crmErr.message);
+        }
       }
     }
   });
 }
 
 connectToWhatsApp();
+
+app.get('/', (req, res) => res.send('<h2>✅ Servidor WhatsApp DCAM Online y Conectado al CRM</h2>'));
 
 app.get('/qr', (req, res) => {
   if (currentQR === 'CONNECTED') return res.send('<h2>✅ WhatsApp ya está conectado</h2>');
@@ -190,10 +261,11 @@ app.get('/qr', (req, res) => {
   </div>`);
 });
 
-app.post('/send-message', async (req, res) => {
+// Endpoint unificado para envíos manuales desde el CRM y proyectos anteriores
+async function handleSend(req, res) {
   const { phone, jid, message, imageUrl } = req.body;
   if ((!phone && !jid) || !sock) {
-    return res.status(400).json({ error: 'Faltan parámetros o socket no listo' });
+    return res.status(400).json({ error: 'Faltan parámetros o WhatsApp desconectado' });
   }
 
   try {
@@ -217,7 +289,10 @@ app.post('/send-message', async (req, res) => {
     console.error('Error enviando:', error);
     res.status(500).json({ error: error.message });
   }
-});
+}
+
+app.post('/send-message', handleSend);
+app.post('/send', handleSend);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
