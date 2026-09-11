@@ -1,102 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
-const { makeWASocket, DisconnectReason, proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
-const { createClient } = require('@supabase/supabase-js');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
-const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
-const supabase = createClient(supabaseUrl, supabaseKey);
-
 const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL || 'https://crm-dcam-produccion.vercel.app/api/whatsapp-webhook';
 const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-dcam-produccion.vercel.app/api/ai-extract';
 
-let sock;
+let sock = null;
 let currentQR = '';
-
-// Adaptador resiliente con timeout para que Supabase nunca congele el arranque
-async function useSupabaseAuthState() {
-  console.log('🔄 Verificando sesión en Supabase...');
-
-  const readData = async (key) => {
-    try {
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout Supabase')), 3500)
-      );
-      const queryPromise = supabase
-        .from('whatsapp_auth')
-        .select('value')
-        .eq('key', key)
-        .maybeSingle();
-
-      const res = await Promise.race([queryPromise, timeoutPromise]);
-      if (res?.error || !res?.data) return null;
-      return JSON.parse(JSON.stringify(res.data.value), BufferJSON.reviver);
-    } catch (error) {
-      console.warn(`⚠️ Supabase omitido para ${key} (${error.message})`);
-      return null;
-    }
-  };
-
-  const writeData = async (key, value) => {
-    try {
-      const parsedValue = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
-      await supabase
-        .from('whatsapp_auth')
-        .upsert({ key, value: parsedValue }, { onConflict: 'key' });
-    } catch (error) {
-      console.error('Error guardando credencial en Supabase:', error.message);
-    }
-  };
-
-  const removeData = async (key) => {
-    try {
-      await supabase.from('whatsapp_auth').delete().eq('key', key);
-    } catch (error) {
-      console.error('Error eliminando credencial en Supabase:', error.message);
-    }
-  };
-
-  const creds = (await readData('creds')) || initAuthCreds();
-
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const data = {};
-          for (const id of ids) {
-            let value = await readData(`${type}-${id}`);
-            if (type === 'app-state-sync-key' && value) {
-              value = proto.Message.AppStateSyncKeyData.fromObject(value);
-            }
-            data[id] = value;
-          }
-          return data;
-        },
-        set: async (data) => {
-          for (const category in data) {
-            for (const id in data[category]) {
-              const value = data[category][id];
-              const key = `${category}-${id}`;
-              if (value) {
-                writeData(key, value).catch(() => {});
-              } else {
-                removeData(key).catch(() => {});
-              }
-            }
-          }
-        }
-      }
-    },
-    saveCreds: () => writeData('creds', creds)
-  };
-}
 
 async function askSolAI(conversationHistory) {
   try {
@@ -113,15 +29,15 @@ async function askSolAI(conversationHistory) {
 }
 
 async function connectToWhatsApp() {
-  console.log('🚀 Iniciando conexión Baileys...');
+  console.log('🚀 Inicializando Baileys con auth local...');
   try {
-    const { state, saveCreds } = await useSupabaseAuthState();
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
 
     sock = makeWASocket({
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: true,
-      browser: ['DCAM CRM', 'Chrome', '1.0.0']
+      browser: ['DCAM Official', 'Chrome', '1.0.0']
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -130,7 +46,7 @@ async function connectToWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log('📲 QR generado con éxito');
+        console.log('📲 QR recibido de Baileys, convirtiendo a DataURL...');
         currentQR = await QRCode.toDataURL(qr);
       }
 
@@ -139,21 +55,25 @@ async function connectToWhatsApp() {
         console.log(`❌ Conexión cerrada. Código: ${statusCode}`);
         if (statusCode !== DisconnectReason.loggedOut) {
           setTimeout(connectToWhatsApp, 3000);
+        } else {
+          console.log('⚠️ Sesión cerrada por WhatsApp. Reiniciando credenciales...');
+          currentQR = '';
+          setTimeout(connectToWhatsApp, 2000);
         }
       } else if (connection === 'open') {
-        console.log('✅ WhatsApp Conectado exitosamente');
+        console.log('✅ WhatsApp CONECTADO exitosamente al número oficial');
         currentQR = 'CONNECTED';
       }
     });
 
-    // Procesar mensajes entrantes
+    // Escuchar mensajes y despachar a Vercel
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
         if (!msg.key.fromMe && msg.message) {
           const rawJid = msg.key.remoteJid || '';
-          if (rawJid.includes('@g.us') || rawJid.includes('@broadcast')) continue;
+          if (rawJid.includes('@g.us') || rawJid.includes('@broadcast') || rawJid === 'status@broadcast') continue;
 
           const text = msg.message.conversation || 
                        msg.message.extendedTextMessage?.text || 
@@ -164,46 +84,10 @@ async function connectToWhatsApp() {
 
           const cleanPhone = rawJid.replace(/\D/g, '');
           const name = msg.pushName || `+${cleanPhone}`;
-          const displayPhone = `+${cleanPhone}`;
+          console.log(`📩 Mensaje entrante de ${name} (${cleanPhone}): ${text}`);
 
-          console.log(`📩 Mensaje entrante de ${name} (${displayPhone}): ${text}`);
-
-          // 1. Guardar en Supabase
           try {
-            let { data: contact } = await supabase
-              .from('contacts')
-              .select('*')
-              .or(`jid.eq.${rawJid},phone.eq.${displayPhone}`)
-              .maybeSingle();
-
-            if (!contact) {
-              const { data: newContact } = await supabase
-                .from('contacts')
-                .insert([{ name, phone: displayPhone, jid: rawJid, status: 'entrante', last_message: text }])
-                .select()
-                .single();
-              contact = newContact;
-            } else {
-              await supabase
-                .from('contacts')
-                .update({ 
-                  last_message: text,
-                  jid: rawJid,
-                  name: (contact.name === contact.phone || !contact.name) ? name : contact.name,
-                  updated_at: new Date().toISOString() 
-                })
-                .eq('id', contact.id);
-            }
-
-            if (contact) {
-              await supabase.from('messages').insert([{ contact_id: contact.id, sender: 'client', text }]);
-            }
-          } catch (dbErr) {
-            console.warn('Advertencia en Supabase contacts:', dbErr.message);
-          }
-
-          // 2. Notificar al CRM en Vercel
-          try {
+            // Notificar al CRM en Vercel
             const resCrm = await fetch(CRM_WEBHOOK_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -213,20 +97,19 @@ async function connectToWhatsApp() {
             const crmData = await resCrm.json();
             const conv = crmData?.conversation;
 
-            // Si Sol está en pausa desde el panel, no responde
             if (conv && conv.botActive === false) {
-              console.log(`⏸️ Sol en pausa para ${name}`);
+              console.log(`⏸️ Sol en pausa manual para ${name}`);
               continue;
             }
 
-            // 3. Respuesta comercial automática con Sol AI
+            // Sol AI
             const history = conv?.messages?.length ? conv.messages : [{ sender: 'client', text }];
             const aiData = await askSolAI(history);
 
             if (aiData?.replyMessage) {
               await sock.sendMessage(rawJid, { text: aiData.replyMessage });
 
-              // Guardar la respuesta de Sol en el CRM y completar la ficha
+              // Guardar la respuesta de Sol y la ficha autocompletada en Vercel
               await fetch(CRM_WEBHOOK_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -238,14 +121,15 @@ async function connectToWhatsApp() {
                 })
               });
             }
-          } catch (crmErr) {
-            console.error('Error puenteando al CRM:', crmErr.message);
+          } catch (e) {
+            console.error('Error puenteando al CRM:', e.message);
           }
         }
       }
     });
+
   } catch (err) {
-    console.error('Error al iniciar socket WhatsApp:', err.message);
+    console.error('Fallo iniciando Baileys:', err.message);
     setTimeout(connectToWhatsApp, 5000);
   }
 }
@@ -253,23 +137,37 @@ async function connectToWhatsApp() {
 connectToWhatsApp();
 
 app.get('/', (req, res) => {
-  res.send('<h2>✅ Servidor WhatsApp DCAM Online y Conectado al CRM</h2>');
+  res.send('<h2>✅ Servidor WhatsApp DCAM Online</h2>');
 });
 
 app.get('/qr', (req, res) => {
   if (currentQR === 'CONNECTED') {
-    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;"><h2>✅ WhatsApp ya está conectado</h2></div>');
+    return res.send(`
+      <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
+        <h2 style="color:#059669;">✅ WhatsApp ya está conectado</h2>
+        <p>El bot y el CRM están listos para recibir mensajes.</p>
+      </div>
+    `);
   }
   if (!currentQR) {
-    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;"><h2>Generando QR, recarga en unos segundos...</h2></div>');
+    return res.send(`
+      <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
+        <h2>Iniciando WhatsApp...</h2>
+        <p>Esta página se recarga sola en 3 segundos.</p>
+        <script>setTimeout(() => location.reload(), 3000);</script>
+      </div>
+    `);
   }
-  res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
-    <h2>Escaneá con el WhatsApp Oficial de DCAM</h2>
-    <img src="${currentQR}" style="width:300px;height:300px;"/>
-  </div>`);
+  res.send(`
+    <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
+      <h2>Escaneá con el WhatsApp Oficial de DCAM</h2>
+      <img src="${currentQR}" style="width:320px;height:320px;border: 1px solid #ccc; border-radius: 8px;"/>
+      <p style="color:#666;font-size:13px;margin-top:10px;">Si tarda en leer, recargá para obtener un QR fresco.</p>
+    </div>
+  `);
 });
 
-// Endpoint unificado para envíos manuales desde el CRM y campañas
+// Endpoint unificado para envíos manuales desde el CRM
 async function handleSend(req, res) {
   const { phone, jid, message, imageUrl } = req.body;
   if ((!phone && !jid) || !sock) {
