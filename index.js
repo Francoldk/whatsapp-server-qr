@@ -1,18 +1,93 @@
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
-const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { createClient } = require('@supabase/supabase-js');
 const pino = require('pino');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL || 'https://crm-dcam-produccion.vercel.app/api/whatsapp-webhook';
+const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
+const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-dcam-produccion.vercel.app/api/ai-extract';
 
 let sock = null;
 let currentQR = '';
+
+// Adaptador de autenticación con Supabase
+async function useSupabaseAuthState() {
+  const readData = async (key) => {
+    try {
+      const { data, error } = await supabase
+        .from('whatsapp_auth')
+        .select('value')
+        .eq('key', key)
+        .maybeSingle();
+      if (error || !data) return null;
+      return JSON.parse(JSON.stringify(data.value), BufferJSON.reviver);
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const writeData = async (key, value) => {
+    try {
+      const parsedValue = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+      await supabase
+        .from('whatsapp_auth')
+        .upsert({ key, value: parsedValue }, { onConflict: 'key' });
+    } catch (error) {
+      console.error('Error guardando en Supabase:', error.message);
+    }
+  };
+
+  const removeData = async (key) => {
+    try {
+      await supabase.from('whatsapp_auth').delete().eq('key', key);
+    } catch (error) {
+      console.error('Error eliminando en Supabase:', error.message);
+    }
+  };
+
+  const creds = (await readData('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }
+          return data;
+        },
+        set: async (data) => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              if (value) {
+                await writeData(key, value);
+              } else {
+                await removeData(key);
+              }
+            }
+          }
+        }
+      }
+    },
+    saveCreds: () => writeData('creds', creds)
+  };
+}
 
 async function askSolAI(conversationHistory) {
   try {
@@ -29,9 +104,9 @@ async function askSolAI(conversationHistory) {
 }
 
 async function connectToWhatsApp() {
-  console.log('🚀 Inicializando Baileys con auth local...');
+  console.log('🚀 Iniciando Baileys conectado a Supabase...');
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+    const { state, saveCreds } = await useSupabaseAuthState();
 
     sock = makeWASocket({
       auth: state,
@@ -46,7 +121,6 @@ async function connectToWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log('📲 QR recibido de Baileys, convirtiendo a DataURL...');
         currentQR = await QRCode.toDataURL(qr);
       }
 
@@ -56,17 +130,16 @@ async function connectToWhatsApp() {
         if (statusCode !== DisconnectReason.loggedOut) {
           setTimeout(connectToWhatsApp, 3000);
         } else {
-          console.log('⚠️ Sesión cerrada por WhatsApp. Reiniciando credenciales...');
           currentQR = '';
           setTimeout(connectToWhatsApp, 2000);
         }
       } else if (connection === 'open') {
-        console.log('✅ WhatsApp CONECTADO exitosamente al número oficial');
+        console.log('✅ WhatsApp CONECTADO exitosamente');
         currentQR = 'CONNECTED';
       }
     });
 
-    // Escuchar mensajes y despachar a Vercel
+    // Escuchar mensajes, persistir en Supabase y responder con Sol AI
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -84,52 +157,108 @@ async function connectToWhatsApp() {
 
           const cleanPhone = rawJid.replace(/\D/g, '');
           const name = msg.pushName || `+${cleanPhone}`;
-          console.log(`📩 Mensaje entrante de ${name} (${cleanPhone}): ${text}`);
+          const displayPhone = `+${cleanPhone}`;
 
+          console.log(`📩 Mensaje entrante de ${name} (${displayPhone}): ${text}`);
+
+          // 1. Guardar o actualizar contacto en Supabase
+          let contact = null;
           try {
-            // Notificar al CRM en Vercel
-            const resCrm = await fetch(CRM_WEBHOOK_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ phone: cleanPhone, name, text, sender: 'client' })
-            });
+            const { data: existing } = await supabase
+              .from('contacts')
+              .select('*')
+              .or(`jid.eq.${rawJid},phone.eq.${displayPhone}`)
+              .maybeSingle();
 
-            const crmData = await resCrm.json();
-            const conv = crmData?.conversation;
-
-            if (conv && conv.botActive === false) {
-              console.log(`⏸️ Sol en pausa manual para ${name}`);
-              continue;
+            if (!existing) {
+              const { data: created } = await supabase
+                .from('contacts')
+                .insert([{
+                  name,
+                  phone: displayPhone,
+                  jid: rawJid,
+                  status: 'Nuevo Lead',
+                  last_message: text,
+                  bot_active: true
+                }])
+                .select()
+                .single();
+              contact = created;
+            } else {
+              const { data: updated } = await supabase
+                .from('contacts')
+                .update({
+                  last_message: text,
+                  jid: rawJid,
+                  name: (existing.name === existing.phone || !existing.name) ? name : existing.name,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', existing.id)
+                .select()
+                .single();
+              contact = updated;
             }
 
-            // Sol AI
-            const history = conv?.messages?.length ? conv.messages : [{ sender: 'client', text }];
-            const aiData = await askSolAI(history);
+            // Guardar el mensaje entrante en Supabase
+            if (contact) {
+              await supabase.from('messages').insert([{
+                contact_id: contact.id,
+                sender: 'client',
+                text: text
+              }]);
+            }
+          } catch (dbErr) {
+            console.error('Error persistiendo en Supabase:', dbErr.message);
+          }
+
+          // Si Sol está en pausa manual desde el CRM, no responder
+          if (contact && contact.bot_active === false) {
+            console.log(`⏸️ Sol en pausa para ${name}`);
+            continue;
+          }
+
+          // 2. Invocar a Sol AI
+          try {
+            const aiData = await askSolAI([{ sender: 'client', text }]);
 
             if (aiData?.replyMessage) {
               await sock.sendMessage(rawJid, { text: aiData.replyMessage });
 
-              // Guardar la respuesta de Sol y la ficha autocompletada en Vercel
-              await fetch(CRM_WEBHOOK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  phone: cleanPhone,
-                  text: aiData.replyMessage,
+              // Guardar la respuesta de Sol en Supabase
+              if (contact) {
+                await supabase.from('messages').insert([{
+                  contact_id: contact.id,
                   sender: 'me',
-                  extractedData: aiData.extractedData || null
-                })
-              });
+                  text: aiData.replyMessage
+                }]);
+
+                const updatePayload = {
+                  last_message: aiData.replyMessage,
+                  updated_at: new Date().toISOString()
+                };
+
+                if (aiData.extractedData) {
+                  updatePayload.quote_data = {
+                    ...(contact.quote_data || {}),
+                    ...aiData.extractedData
+                  };
+                }
+                if (aiData.suggestedStatus) {
+                  updatePayload.status = aiData.suggestedStatus;
+                }
+
+                await supabase.from('contacts').update(updatePayload).eq('id', contact.id);
+              }
             }
-          } catch (e) {
-            console.error('Error puenteando al CRM:', e.message);
+          } catch (aiErr) {
+            console.error('Error llamando a Sol AI:', aiErr.message);
           }
         }
       }
     });
 
   } catch (err) {
-    console.error('Fallo iniciando Baileys:', err.message);
+    console.error('Error inicializando Baileys:', err.message);
     setTimeout(connectToWhatsApp, 5000);
   }
 }
@@ -137,34 +266,20 @@ async function connectToWhatsApp() {
 connectToWhatsApp();
 
 app.get('/', (req, res) => {
-  res.send('<h2>✅ Servidor WhatsApp DCAM Online</h2>');
+  res.send('<h2>✅ Servidor WhatsApp DCAM Online y Conectado a Supabase</h2>');
 });
 
 app.get('/qr', (req, res) => {
   if (currentQR === 'CONNECTED') {
-    return res.send(`
-      <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
-        <h2 style="color:#059669;">✅ WhatsApp ya está conectado</h2>
-        <p>El bot y el CRM están listos para recibir mensajes.</p>
-      </div>
-    `);
+    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;"><h2 style="color:#059669;">✅ WhatsApp ya está conectado</h2></div>');
   }
   if (!currentQR) {
-    return res.send(`
-      <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
-        <h2>Iniciando WhatsApp...</h2>
-        <p>Esta página se recarga sola en 3 segundos.</p>
-        <script>setTimeout(() => location.reload(), 3000);</script>
-      </div>
-    `);
+    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;"><h2>Generando QR, recarga en unos segundos...</h2><script>setTimeout(()=>location.reload(),3000);</script></div>');
   }
-  res.send(`
-    <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
-      <h2>Escaneá con el WhatsApp Oficial de DCAM</h2>
-      <img src="${currentQR}" style="width:320px;height:320px;border: 1px solid #ccc; border-radius: 8px;"/>
-      <p style="color:#666;font-size:13px;margin-top:10px;">Si tarda en leer, recargá para obtener un QR fresco.</p>
-    </div>
-  `);
+  res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
+    <h2>Escaneá con el WhatsApp Oficial de DCAM</h2>
+    <img src="${currentQR}" style="width:320px;height:320px;border: 1px solid #ccc; border-radius: 8px;"/>
+  </div>`);
 });
 
 // Endpoint unificado para envíos manuales desde el CRM
@@ -192,7 +307,7 @@ async function handleSend(req, res) {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Error enviando mensaje:', error);
+    console.error('Error enviando mensaje manual:', error);
     res.status(500).json({ error: error.message });
   }
 }
