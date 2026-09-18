@@ -6,8 +6,13 @@ const { createClient } = require('@supabase/supabase-js');
 const pino = require('pino');
 
 const app = express();
-app.use(cors());
+
+// Middlewares y cabeceras CORS explícitas para evitar requests trabados en pending
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
+
+// Responder preflight OPTIONS de forma inmediata
+app.options('*', cors());
 
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
@@ -298,8 +303,11 @@ app.get('/qr', (req, res) => {
 
 // Endpoint unificado para envíos manuales desde el CRM, cotizador o lanzador
 async function handleSend(req, res) {
+  console.log('📤 Intento de envío manual recibido en /send:', req.body);
   const { phone, jid, message, imageUrl } = req.body;
+
   if ((!phone && !jid) || !sock) {
+    console.error('❌ Falta phone/jid o sock es nulo:', { phone, jid, hasSock: !!sock });
     return res.status(400).json({ error: 'Faltan parámetros o WhatsApp desconectado' });
   }
 
@@ -319,15 +327,43 @@ async function handleSend(req, res) {
       await sock.sendMessage(targetJid, { text: message });
     }
 
-    res.json({ success: true });
+    console.log(`✅ Mensaje despachado con éxito por Baileys a ${targetJid}`);
+
+    // Persistir el mensaje enviado manualmente en Supabase para que el CRM no lo borre al hacer polling
+    try {
+      const cleanPhone = targetJid.replace(/\D/g, '');
+      const displayPhone = `+${cleanPhone}`;
+      const { data: contact } = await supabase
+        .from('contacts')
+        .select('id')
+        .or(`jid.eq.${targetJid},phone.eq.${displayPhone}`)
+        .maybeSingle();
+
+      if (contact) {
+        await supabase.from('messages').insert([{
+          contact_id: contact.id,
+          sender: 'me',
+          text: message || (imageUrl ? '📷 Imagen enviada' : '')
+        }]);
+
+        await supabase.from('contacts').update({
+          last_message: message || (imageUrl ? '📷 Imagen enviada' : ''),
+          updated_at: new Date().toISOString()
+        }).eq('id', contact.id);
+      }
+    } catch (dbSaveErr) {
+      console.error('Aviso: no se pudo persistir en supabase el mensaje manual:', dbSaveErr.message);
+    }
+
+    return res.status(200).json({ success: true });
   } catch (error) {
-    console.error('Error enviando mensaje manual:', error);
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error enviando mensaje manual:', error);
+    return res.status(500).json({ error: error.message });
   }
 }
 
 app.post('/send-message', handleSend);
 app.post('/send', handleSend);
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
