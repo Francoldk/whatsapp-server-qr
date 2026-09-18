@@ -13,12 +13,13 @@ const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.su
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-dcam-produccion.vercel.app/api/ai-extract';
+// URL de producción real en Vercel
+const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-whatsapp-simple-1.vercel.app/api/ai-extract';
 
 let sock = null;
 let currentQR = '';
 
-// Adaptador de autenticación con Supabase
+// Adaptador de autenticación persistente con Supabase
 async function useSupabaseAuthState() {
   const readData = async (key) => {
     try {
@@ -91,14 +92,23 @@ async function useSupabaseAuthState() {
 
 async function askSolAI(conversationHistory) {
   try {
+    console.log('🤖 Consultando a Sol AI...');
     const res = await fetch(AI_EXTRACT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ conversationHistory })
     });
-    return await res.json();
+
+    if (!res.ok) {
+      console.error(`❌ Sol AI respondió con estado ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    console.log('✅ Respuesta de Sol AI recibida:', data?.replyMessage);
+    return data;
   } catch (err) {
-    console.error('Error llamando a Sol AI:', err.message);
+    console.error('❌ Error de conexión con Sol AI:', err.message);
     return null;
   }
 }
@@ -171,7 +181,7 @@ async function connectToWhatsApp() {
               .maybeSingle();
 
             if (!existing) {
-              const { data: created } = await supabase
+              const { data: created, error: errInsert } = await supabase
                 .from('contacts')
                 .insert([{
                   name,
@@ -183,9 +193,11 @@ async function connectToWhatsApp() {
                 }])
                 .select()
                 .single();
+
+              if (errInsert) console.error('Error insertando contacto:', errInsert.message);
               contact = created;
             } else {
-              const { data: updated } = await supabase
+              const { data: updated, error: errUpdate } = await supabase
                 .from('contacts')
                 .update({
                   last_message: text,
@@ -196,10 +208,12 @@ async function connectToWhatsApp() {
                 .eq('id', existing.id)
                 .select()
                 .single();
+
+              if (errUpdate) console.error('Error actualizando contacto:', errUpdate.message);
               contact = updated;
             }
 
-            // Guardar el mensaje entrante en Supabase
+            // Guardar el mensaje del cliente en Supabase
             if (contact) {
               await supabase.from('messages').insert([{
                 contact_id: contact.id,
@@ -208,10 +222,10 @@ async function connectToWhatsApp() {
               }]);
             }
           } catch (dbErr) {
-            console.error('Error persistiendo en Supabase:', dbErr.message);
+            console.error('Error DB Supabase:', dbErr.message);
           }
 
-          // Si Sol está en pausa manual desde el CRM, no responder
+          // Si el bot está en pausa manual desde el CRM, no responder
           if (contact && contact.bot_active === false) {
             console.log(`⏸️ Sol en pausa para ${name}`);
             continue;
@@ -224,7 +238,7 @@ async function connectToWhatsApp() {
             if (aiData?.replyMessage) {
               await sock.sendMessage(rawJid, { text: aiData.replyMessage });
 
-              // Guardar la respuesta de Sol en Supabase
+              // Guardar la respuesta enviada por Sol en Supabase
               if (contact) {
                 await supabase.from('messages').insert([{
                   contact_id: contact.id,
@@ -251,7 +265,7 @@ async function connectToWhatsApp() {
               }
             }
           } catch (aiErr) {
-            console.error('Error llamando a Sol AI:', aiErr.message);
+            console.error('Error procesando respuesta de Sol AI:', aiErr.message);
           }
         }
       }
@@ -282,7 +296,7 @@ app.get('/qr', (req, res) => {
   </div>`);
 });
 
-// Endpoint unificado para envíos manuales desde el CRM
+// Endpoint unificado para envíos manuales desde el CRM, cotizador o lanzador
 async function handleSend(req, res) {
   const { phone, jid, message, imageUrl } = req.body;
   if ((!phone && !jid) || !sock) {
