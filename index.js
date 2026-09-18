@@ -1,24 +1,29 @@
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
-const { makeWASocket, DisconnectReason, proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { 
+  makeWASocket, 
+  DisconnectReason, 
+  proto, 
+  initAuthCreds, 
+  BufferJSON, 
+  downloadMediaMessage 
+} = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const pino = require('pino');
 
 const app = express();
 
-// Middlewares y cabeceras CORS explícitas para evitar requests trabados en pending
+// Middlewares y cabeceras CORS explícitas
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
-app.use(express.json());
-
-// Responder preflight OPTIONS de forma inmediata
+app.use(express.json({ limit: '50mb' }));
 app.options('*', cors());
 
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// URL de producción real en Vercel
+// URL de producción en Vercel
 const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-whatsapp-simple-1.vercel.app/api/ai-extract';
 
 let sock = null;
@@ -95,13 +100,18 @@ async function useSupabaseAuthState() {
   };
 }
 
-async function askSolAI(conversationHistory) {
+async function askSolAI(conversationHistory, imageBase64 = null) {
   try {
-    console.log('🤖 Consultando a Sol AI...');
+    console.log('🤖 Consultando a Sol AI (multimodal)...');
+    const payload = { conversationHistory };
+    if (imageBase64) {
+      payload.imageBase64 = imageBase64;
+    }
+
     const res = await fetch(AI_EXTRACT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationHistory })
+      body: JSON.stringify(payload)
     });
 
     if (!res.ok) {
@@ -154,7 +164,6 @@ async function connectToWhatsApp() {
       }
     });
 
-    // Escuchar mensajes, persistir en Supabase y responder con Sol AI
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -163,20 +172,38 @@ async function connectToWhatsApp() {
           const rawJid = msg.key.remoteJid || '';
           if (rawJid.includes('@g.us') || rawJid.includes('@broadcast') || rawJid === 'status@broadcast') continue;
 
-          const text = msg.message.conversation || 
-                       msg.message.extendedTextMessage?.text || 
-                       (msg.message.imageMessage ? '📷 Imagen recibida' : '') ||
-                       (msg.message.documentMessage ? `📄 Documento PDF: ${msg.message.documentMessage.fileName || 'archivo.pdf'}` : '');
+          let imageBase64 = null;
+          let text = msg.message.conversation || 
+                     msg.message.extendedTextMessage?.text || '';
+
+          // Descarga directa del archivo de imagen para procesamiento con Groq
+          if (msg.message.imageMessage) {
+            try {
+              const buffer = await downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+                { logger: pino({ level: 'silent' }) }
+              );
+              imageBase64 = buffer.toString('base64');
+              text = msg.message.imageMessage.caption || 'Adjunto foto del producto o etiqueta para cotizar.';
+            } catch (mediaErr) {
+              console.error('Error descargando imagen de WhatsApp:', mediaErr.message);
+              text = '📷 Imagen recibida';
+            }
+          } else if (msg.message.documentMessage) {
+            text = `📄 Documento PDF: ${msg.message.documentMessage.fileName || 'archivo.pdf'}`;
+          }
           
-          if (!text) continue;
+          if (!text && !imageBase64) continue;
 
           const cleanPhone = rawJid.replace(/\D/g, '');
           const name = msg.pushName || `+${cleanPhone}`;
           const displayPhone = `+${cleanPhone}`;
 
-          console.log(`📩 Mensaje entrante de ${name} (${displayPhone}): ${text}`);
+          console.log(`📩 Mensaje de ${name} (${displayPhone}): ${text} ${imageBase64 ? '[FOTO ADJUNTA]' : ''}`);
 
-          // 1. Guardar o actualizar contacto en Supabase
+          // 1. Persistencia en Supabase
           let contact = null;
           try {
             const { data: existing } = await supabase
@@ -218,7 +245,6 @@ async function connectToWhatsApp() {
               contact = updated;
             }
 
-            // Guardar el mensaje del cliente en Supabase
             if (contact) {
               await supabase.from('messages').insert([{
                 contact_id: contact.id,
@@ -230,20 +256,18 @@ async function connectToWhatsApp() {
             console.error('Error DB Supabase:', dbErr.message);
           }
 
-          // Si el bot está en pausa manual desde el CRM, no responder
           if (contact && contact.bot_active === false) {
             console.log(`⏸️ Sol en pausa para ${name}`);
             continue;
           }
 
-          // 2. Invocar a Sol AI
+          // 2. Procesamiento de Sol AI con imagen
           try {
-            const aiData = await askSolAI([{ sender: 'client', text }]);
+            const aiData = await askSolAI([{ sender: 'client', text }], imageBase64);
 
             if (aiData?.replyMessage) {
               await sock.sendMessage(rawJid, { text: aiData.replyMessage });
 
-              // Guardar la respuesta enviada por Sol en Supabase
               if (contact) {
                 await supabase.from('messages').insert([{
                   contact_id: contact.id,
@@ -301,13 +325,11 @@ app.get('/qr', (req, res) => {
   </div>`);
 });
 
-// Endpoint unificado para envíos manuales desde el CRM, cotizador o lanzador
+// Endpoint para envíos manuales
 async function handleSend(req, res) {
-  console.log('📤 Intento de envío manual recibido en /send:', req.body);
   const { phone, jid, message, imageUrl } = req.body;
 
   if ((!phone && !jid) || !sock) {
-    console.error('❌ Falta phone/jid o sock es nulo:', { phone, jid, hasSock: !!sock });
     return res.status(400).json({ error: 'Faltan parámetros o WhatsApp desconectado' });
   }
 
@@ -327,9 +349,6 @@ async function handleSend(req, res) {
       await sock.sendMessage(targetJid, { text: message });
     }
 
-    console.log(`✅ Mensaje despachado con éxito por Baileys a ${targetJid}`);
-
-    // Persistir el mensaje enviado manualmente en Supabase para que el CRM no lo borre al hacer polling
     try {
       const cleanPhone = targetJid.replace(/\D/g, '');
       const displayPhone = `+${cleanPhone}`;
@@ -352,12 +371,11 @@ async function handleSend(req, res) {
         }).eq('id', contact.id);
       }
     } catch (dbSaveErr) {
-      console.error('Aviso: no se pudo persistir en supabase el mensaje manual:', dbSaveErr.message);
+      console.error('Aviso Supabase envío manual:', dbSaveErr.message);
     }
 
     return res.status(200).json({ success: true });
   } catch (error) {
-    console.error('❌ Error enviando mensaje manual:', error);
     return res.status(500).json({ error: error.message });
   }
 }
