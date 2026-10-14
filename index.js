@@ -14,42 +14,149 @@ const pino = require('pino');
 
 const app = express();
 
+// Middlewares y cabeceras CORS explícitas
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '50mb' }));
-app.options('/{*splat}', (req, res) => {
-  res.sendStatus(200);
-});
+app.options('/{*splat}', cors());
 
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// URL de producción en Vercel
 const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-whatsapp-simple-1.vercel.app/api/ai-extract';
 
 let sock = null;
 let currentQR = '';
 
-// 🔥 Memoria temporal para no duplicar los mensajes que enviamos desde el CRM
-const apiSentMessages = new Set();
+// Distingue envíos de este servidor de mensajes escritos en el celular.
+const serverSentIds = new Map();
+const serverSentTexts = new Map();
+const seenEvents = new Map();
+function remember(map, key, ttl = 180000) {
+  if (!key) return;
+  map.set(key, Date.now() + ttl);
+  if (map.size > 1500) {
+    for (const [k, until] of map) if (until < Date.now()) map.delete(k);
+  }
+}
+function remembered(map, key) {
+  const until = map.get(key);
+  if (!until) return false;
+  if (until < Date.now()) { map.delete(key); return false; }
+  return true;
+}
+function markServerSent(sent, jid, text) {
+  remember(serverSentIds, sent?.key?.id, 300000);
+  if (text) remember(serverSentTexts, `${jid}|${text}`, 90000);
+}
+function unwrapMessage(msg) {
+  let body = msg?.message || {};
+  for (let i = 0; i < 4; i++) {
+    const nested = body.ephemeralMessage?.message ||
+      body.viewOnceMessage?.message || body.viewOnceMessageV2?.message ||
+      body.documentWithCaptionMessage?.message;
+    if (!nested) break;
+    body = nested;
+  }
+  return body;
+}
+async function transcribeAudio(msg) {
+  if (!process.env.GROQ_API_KEY) {
+    console.error('🎤 Falta GROQ_API_KEY en Render: no se puede transcribir');
+    return null;
+  }
+  try {
+    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+      logger: pino({ level: 'silent' }),
+      reuploadRequest: sock?.updateMediaMessage?.bind(sock)
+    });
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: 'audio/ogg' }), 'nota-voz.ogg');
+    form.append('model', 'whisper-large-v3');
+    form.append('language', 'es');
+    const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: form
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Whisper HTTP ${response.status}: ${err.slice(0, 250)}`);
+    }
+    const payload = await response.json();
+    return String(payload.text || '').trim() || null;
+  } catch (error) {
+    console.error('🎤 Error transcribiendo audio:', error.message);
+    return null;
+  }
+}
+async function saveMessageInCRM({ rawJid, name, text, fromMe }) {
+  const digits = rawJid.split('@')[0].replace(/\D/g, '');
+  const phone = `+${digits}`;
+  const { data: existing, error: lookupError } = await supabase.from('contacts')
+    .select('*').or(`jid.eq.${rawJid},phone.eq.${phone}`).maybeSingle();
+  if (lookupError) throw lookupError;
+  let contact = existing;
+  if (!contact) {
+    const { data, error } = await supabase.from('contacts').insert([{
+      name: name || phone, phone, jid: rawJid, status: 'Entrante',
+      last_message: text, bot_active: true
+    }]).select().single();
+    if (error) throw error;
+    contact = data;
+  }
+  const { error: insertError } = await supabase.from('messages').insert([{
+    contact_id: contact.id, sender: fromMe ? 'me' : 'client', text
+  }]);
+  if (insertError) throw insertError;
+  const { error: updateError } = await supabase.from('contacts').update({
+    last_message: text, jid: rawJid,
+    name: !fromMe && (!contact.name || contact.name === contact.phone) ? name : contact.name,
+    updated_at: new Date().toISOString()
+  }).eq('id', contact.id);
+  if (updateError) console.error('Error actualizando contacto:', updateError.message);
+  return contact;
+}
 
+
+// Adaptador de autenticación persistente con Supabase
 async function useSupabaseAuthState() {
   const readData = async (key) => {
     try {
-      const { data, error } = await supabase.from('whatsapp_auth').select('value').eq('key', key).maybeSingle();
+      const { data, error } = await supabase
+        .from('whatsapp_auth')
+        .select('value')
+        .eq('key', key)
+        .maybeSingle();
       if (error || !data) return null;
       return JSON.parse(JSON.stringify(data.value), BufferJSON.reviver);
-    } catch (error) { return null; }
+    } catch (error) {
+      return null;
+    }
   };
+
   const writeData = async (key, value) => {
     try {
       const parsedValue = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
-      await supabase.from('whatsapp_auth').upsert({ key, value: parsedValue }, { onConflict: 'key' });
-    } catch (error) {}
+      await supabase
+        .from('whatsapp_auth')
+        .upsert({ key, value: parsedValue }, { onConflict: 'key' });
+    } catch (error) {
+      console.error('Error guardando en Supabase:', error.message);
+    }
   };
+
   const removeData = async (key) => {
-    try { await supabase.from('whatsapp_auth').delete().eq('key', key); } catch (error) {}
+    try {
+      await supabase.from('whatsapp_auth').delete().eq('key', key);
+    } catch (error) {
+      console.error('Error eliminando en Supabase:', error.message);
+    }
   };
+
   const creds = (await readData('creds')) || initAuthCreds();
+
   return {
     state: {
       creds,
@@ -58,7 +165,9 @@ async function useSupabaseAuthState() {
           const data = {};
           for (const id of ids) {
             let value = await readData(`${type}-${id}`);
-            if (type === 'app-state-sync-key' && value) value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
             data[id] = value;
           }
           return data;
@@ -68,8 +177,11 @@ async function useSupabaseAuthState() {
             for (const id in data[category]) {
               const value = data[category][id];
               const key = `${category}-${id}`;
-              if (value) await writeData(key, value);
-              else await removeData(key);
+              if (value) {
+                await writeData(key, value);
+              } else {
+                await removeData(key);
+              }
             }
           }
         }
@@ -81,36 +193,62 @@ async function useSupabaseAuthState() {
 
 async function askSolAI(conversationHistory, imageBase64 = null) {
   try {
+    console.log('🤖 Consultando a Sol AI (multimodal)...');
     const payload = { conversationHistory };
-    if (imageBase64) payload.imageBase64 = imageBase64;
+    if (imageBase64) {
+      payload.imageBase64 = imageBase64;
+    }
+
     const res = await fetch(AI_EXTRACT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (err) { return null; }
+
+    if (!res.ok) {
+      console.error(`❌ Sol AI respondió con estado ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    console.log('✅ Respuesta de Sol AI recibida:', data?.replyMessage);
+    return data;
+  } catch (err) {
+    console.error('❌ Error de conexión con Sol AI:', err.message);
+    return null;
+  }
 }
 
 async function connectToWhatsApp() {
   console.log('🚀 Iniciando Baileys conectado a Supabase...');
   try {
     const { state, saveCreds } = await useSupabaseAuthState();
+
     sock = makeWASocket({
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: true,
       browser: ['DCAM Official', 'Chrome', '1.0.0']
     });
+
     sock.ev.on('creds.update', saveCreds);
+
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      if (qr) currentQR = await QRCode.toDataURL(qr);
+
+      if (qr) {
+        currentQR = await QRCode.toDataURL(qr);
+      }
+
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-        if (statusCode !== DisconnectReason.loggedOut) setTimeout(connectToWhatsApp, 3000);
-        else { currentQR = ''; setTimeout(connectToWhatsApp, 2000); }
+        console.log(`❌ Conexión cerrada. Código: ${statusCode}`);
+        if (statusCode !== DisconnectReason.loggedOut) {
+          setTimeout(connectToWhatsApp, 3000);
+        } else {
+          currentQR = '';
+          setTimeout(connectToWhatsApp, 2000);
+        }
       } else if (connection === 'open') {
         console.log('✅ WhatsApp CONECTADO exitosamente');
         currentQR = 'CONNECTED';
@@ -118,103 +256,119 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-
-      for (const msg of messages) {
-        if (!msg.message) continue;
-
-        const isFromMe = msg.key.fromMe;
-        const msgId = msg.key.id;
-        const rawJid = msg.key.remoteJid || '';
-        if (rawJid.includes('@g.us') || rawJid.includes('@broadcast') || rawJid === 'status@broadcast') continue;
-
-        // Si el mensaje lo enviamos desde el CRM recién, lo ignoramos acá para no guardarlo doble en Supabase
-        if (isFromMe && apiSentMessages.has(msgId)) {
-            apiSentMessages.delete(msgId);
-            continue;
-        }
-
-        let imageBase64 = null;
-        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-
-        if (msg.message.imageMessage) {
-          try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
-            imageBase64 = buffer.toString('base64');
-            text = msg.message.imageMessage.caption || 'Adjunto foto.';
-          } catch (err) { text = '📷 Imagen recibida'; }
-        } else if (msg.message.documentMessage) {
-          text = `📄 Documento: ${msg.message.documentMessage.fileName || 'archivo'}`;
-        }
-        
-        if (!text && !imageBase64) continue;
-
-        const cleanPhone = rawJid.replace(/\D/g, '');
-        const name = msg.pushName || `+${cleanPhone}`;
-        const displayPhone = `+${cleanPhone}`;
-
-        // 1. Guardar en Base de Datos (captura tus mensajes del celular y los del cliente)
-        let contact = null;
+      // notify: eventos en vivo. append: algunas sincronizaciones desde el celular.
+      if (type !== 'notify' && type !== 'append') return;
+      for (const msg of messages || []) {
         try {
-          const { data: existing } = await supabase.from('contacts').select('*').or(`jid.eq.${rawJid},phone.eq.${displayPhone}`).maybeSingle();
-          if (!existing) {
-            const { data: created } = await supabase.from('contacts').insert([{
-              name, phone: displayPhone, jid: rawJid, status: 'Nuevo Lead', last_message: text, bot_active: true
-            }]).select().single();
-            contact = created;
-          } else {
-            const { data: updated } = await supabase.from('contacts').update({
-              last_message: text, jid: rawJid, name: (existing.name === existing.phone || !existing.name) ? name : existing.name, updated_at: new Date().toISOString()
-            }).eq('id', existing.id).select().single();
-            contact = updated;
+          if (!msg?.message) continue;
+          const rawJid = msg.key?.remoteJid || '';
+          if (!rawJid.endsWith('@s.whatsapp.net') && !rawJid.endsWith('@lid')) continue;
+          const fromMe = msg.key.fromMe === true;
+          const messageId = `${rawJid}|${msg.key.id || ''}`;
+          if (msg.key.id && remembered(seenEvents, messageId)) continue;
+          // Evita importar conversaciones antiguas cuando Baileys sincroniza el historial.
+          if (type === 'append') {
+            if (!fromMe) continue;
+            const time = Number(msg.messageTimestamp?.low ?? msg.messageTimestamp ?? 0);
+            if (!time || Math.abs(Date.now() / 1000 - time) > 180) continue;
           }
-
-          if (contact) {
-            await supabase.from('messages').insert([{
-              contact_id: contact.id,
-              sender: isFromMe ? 'me' : 'client',
-              text: text
-            }]);
-          }
-        } catch (dbErr) { console.error('Error DB Supabase:', dbErr.message); }
-
-        // 🛑 CRÍTICO: Si el mensaje lo mandaste VOS desde el celu, frenamos acá. No consultamos a la IA.
-        if (isFromMe) continue;
-
-        if (contact && contact.bot_active === false) continue;
-
-        // 2. Procesamiento de Sol AI (Solo responde al cliente)
-        try {
-          const aiData = await askSolAI([{ sender: 'client', text }], imageBase64);
-          if (aiData?.replyMessage) {
-            await sock.sendMessage(rawJid, { text: aiData.replyMessage });
-            if (contact) {
-              await supabase.from('messages').insert([{ contact_id: contact.id, sender: 'me', text: aiData.replyMessage }]);
-              const updatePayload = { last_message: aiData.replyMessage, updated_at: new Date().toISOString() };
-              if (aiData.extractedData) updatePayload.quote_data = { ...(contact.quote_data || {}), ...aiData.extractedData };
-              if (aiData.suggestedStatus) updatePayload.status = aiData.suggestedStatus;
-              await supabase.from('contacts').update(updatePayload).eq('id', contact.id);
+          const body = unwrapMessage(msg);
+          let imageBase64 = null;
+          let text = body.conversation || body.extendedTextMessage?.text ||
+            body.imageMessage?.caption || body.documentMessage?.caption || '';
+          if (body.audioMessage) {
+            const transcribed = await transcribeAudio(msg);
+            text = transcribed ? `🎤 Audio: ${transcribed}` : '🎤 Audio recibido — transcripción no disponible';
+          } else if (body.imageMessage) {
+            if (!fromMe) {
+              try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                  logger: pino({ level: 'silent' }),
+                  reuploadRequest: sock?.updateMediaMessage?.bind(sock)
+                });
+                imageBase64 = buffer.toString('base64');
+              } catch (e) {
+                console.error('Error descargando imagen:', e.message);
+              }
             }
+            text = text || (fromMe ? '📷 Imagen enviada' : '📷 Imagen recibida');
+          } else if (body.documentMessage) {
+            text = text || `📄 Documento: ${body.documentMessage.fileName || 'archivo'}`;
+          } else if (body.videoMessage) {
+            text = text || (fromMe ? '🎬 Video enviado' : '🎬 Video recibido');
           }
-        } catch (aiErr) {}
+          if (!text.trim() && !imageBase64) continue;
+          if (fromMe && (remembered(serverSentIds, msg.key.id) || remembered(serverSentTexts, `${rawJid}|${text}`))) {
+            if (msg.key.id) remember(seenEvents, messageId);
+            continue;
+          }
+          const name = msg.pushName || `+${rawJid.split('@')[0]}`;
+          // Registrar antes de responder. Los propios NUNCA activan a Sol.
+          const contact = await saveMessageInCRM({ rawJid, name, text, fromMe });
+          if (msg.key.id) remember(seenEvents, messageId);
+          console.log(`${fromMe ? '📤 Celular' : '📩 Cliente'}: ${name}: ${text.slice(0, 120)}`);
+          if (fromMe || !contact || contact.bot_active === false) continue;
+          // El contenido transcrito se incluye como texto y Sol puede interpretarlo.
+          if (body.audioMessage && text.includes('transcripción no disponible')) continue;
+          const { data: recent, error: historyError } = await supabase.from('messages')
+            .select('sender,text').eq('contact_id', contact.id)
+            .order('created_at', { ascending: false }).limit(30);
+          if (historyError) console.error('Error obteniendo historial:', historyError.message);
+          const history = recent?.length ? recent.reverse() : [{ sender: 'client', text }];
+          const aiData = await askSolAI(history, imageBase64);
+          if (!aiData?.replyMessage) continue;
+          const sent = await sock.sendMessage(rawJid, { text: aiData.replyMessage });
+          markServerSent(sent, rawJid, aiData.replyMessage);
+          const { error: sentError } = await supabase.from('messages').insert([{
+            contact_id: contact.id, sender: 'me', text: aiData.replyMessage
+          }]);
+          if (sentError) console.error('Error guardando respuesta de Sol:', sentError.message);
+          const extracted = Object.fromEntries(Object.entries(aiData.extractedData || {})
+            .filter(([, value]) => value != null && value !== ''));
+          await supabase.from('contacts').update({
+            last_message: aiData.replyMessage,
+            updated_at: new Date().toISOString(),
+            quote_data: { ...(contact.quote_data || {}), ...extracted },
+            ...(aiData.suggestedStatus ? { status: aiData.suggestedStatus } : {})
+          }).eq('id', contact.id);
+        } catch (error) {
+          console.error('❌ Error procesando mensaje WhatsApp:', error.message);
+        }
       }
     });
-  } catch (err) { setTimeout(connectToWhatsApp, 5000); }
+
+  } catch (err) {
+    console.error('Error inicializando Baileys:', err.message);
+    setTimeout(connectToWhatsApp, 5000);
+  }
 }
 
 connectToWhatsApp();
 
-app.get('/', (req, res) => res.send('<h2>✅ Servidor WhatsApp DCAM Online</h2>'));
-app.get('/qr', (req, res) => {
-  if (currentQR === 'CONNECTED') return res.send('<h2>✅ WhatsApp ya está conectado</h2>');
-  if (!currentQR) return res.send('<h2>Generando QR, recarga...</h2><script>setTimeout(()=>location.reload(),3000);</script>');
-  res.send(`<h2>Escaneá el QR</h2><img src="${currentQR}" style="width:320px;height:320px;"/>`);
+app.get('/', (req, res) => {
+  res.send('<h2>✅ Servidor WhatsApp DCAM Online y Conectado a Supabase</h2>');
 });
 
-// Endpoint para envíos manuales desde el CRM Vercel
+app.get('/qr', (req, res) => {
+  if (currentQR === 'CONNECTED') {
+    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;"><h2 style="color:#059669;">✅ WhatsApp ya está conectado</h2></div>');
+  }
+  if (!currentQR) {
+    return res.send('<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;"><h2>Generando QR, recarga en unos segundos...</h2><script>setTimeout(()=>location.reload(),3000);</script></div>');
+  }
+  res.send(`<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
+    <h2>Escaneá con el WhatsApp Oficial de DCAM</h2>
+    <img src="${currentQR}" style="width:320px;height:320px;border: 1px solid #ccc; border-radius: 8px;"/>
+  </div>`);
+});
+
+// Endpoint para envíos manuales
 async function handleSend(req, res) {
   const { phone, jid, message, imageUrl } = req.body;
-  if ((!phone && !jid) || !sock) return res.status(400).json({ error: 'Faltan parámetros' });
+
+  if ((!phone && !jid) || !sock) {
+    return res.status(400).json({ error: 'Faltan parámetros o WhatsApp desconectado' });
+  }
 
   try {
     let targetJid = jid;
@@ -223,28 +377,37 @@ async function handleSend(req, res) {
       targetJid = `${cleanDigits}@s.whatsapp.net`;
     }
 
-    // 🔥 FIX DEL 9 ARGENTINO: Buscamos el JID real que Baileys registró en la DB
-    const cleanPhoneStr = phone ? phone.replace(/\D/g, '') : targetJid.replace(/\D/g, '');
-    const { data: contact } = await supabase
-      .from('contacts')
-      .select('jid')
-      .or(`phone.eq.+${cleanPhoneStr},jid.eq.${targetJid}`)
-      .maybeSingle();
-
-    if (contact && contact.jid) {
-      targetJid = contact.jid; 
-    }
-
-    let sentMsg;
     if (imageUrl) {
-      sentMsg = await sock.sendMessage(targetJid, { image: { url: imageUrl }, caption: message || '' });
+      const sent = await sock.sendMessage(targetJid, { image: { url: imageUrl }, caption: message || '' });
+      markServerSent(sent, targetJid, message || '📷 Imagen enviada');
     } else {
-      sentMsg = await sock.sendMessage(targetJid, { text: message });
+      const sent = await sock.sendMessage(targetJid, { text: message });
+      markServerSent(sent, targetJid, message);
     }
 
-    // Anotamos el ID del mensaje para que la función upsert de arriba NO lo duplique en la base de datos (Vercel ya lo guardó)
-    if (sentMsg && sentMsg.key && sentMsg.key.id) {
-      apiSentMessages.add(sentMsg.key.id);
+    try {
+      const cleanPhone = targetJid.replace(/\D/g, '');
+      const displayPhone = `+${cleanPhone}`;
+      const { data: contact } = await supabase
+        .from('contacts')
+        .select('id')
+        .or(`jid.eq.${targetJid},phone.eq.${displayPhone}`)
+        .maybeSingle();
+
+      if (contact) {
+        await supabase.from('messages').insert([{
+          contact_id: contact.id,
+          sender: 'me',
+          text: message || (imageUrl ? '📷 Imagen enviada' : '')
+        }]);
+
+        await supabase.from('contacts').update({
+          last_message: message || (imageUrl ? '📷 Imagen enviada' : ''),
+          updated_at: new Date().toISOString()
+        }).eq('id', contact.id);
+      }
+    } catch (dbSaveErr) {
+      console.error('Aviso Supabase envío manual:', dbSaveErr.message);
     }
 
     return res.status(200).json({ success: true });
@@ -257,4 +420,4 @@ app.post('/send-message', handleSend);
 app.post('/send', handleSend);
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
