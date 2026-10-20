@@ -22,6 +22,8 @@ app.options('/{*splat}', cors());
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
+const mediaDb = process.env.SUPABASE_SERVICE_ROLE_KEY ? createClient(supabaseUrl, process.env.SUPABASE_SERVICE_ROLE_KEY) : null;
+const { randomUUID } = require('crypto');
 
 // URL de producción en Vercel
 const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-whatsapp-simple-1.vercel.app/api/ai-extract';
@@ -91,7 +93,38 @@ async function transcribeAudio(msg) {
     return null;
   }
 }
-async function saveMessageInCRM({ rawJid, name, text, fromMe }) {
+// Archivos adjuntos guardados en bucket privado de Supabase.
+async function storeWhatsAppMedia(msg, body, jid) {
+  const entry = body.audioMessage || body.imageMessage || body.documentMessage || body.videoMessage;
+  if (!entry) return null;
+  if (!mediaDb) {
+    console.error('Adjunto no guardado: falta SUPABASE_SERVICE_ROLE_KEY en Render');
+    return null;
+  }
+  const mediaType = body.audioMessage ? 'audio' : body.imageMessage ? 'image' : body.videoMessage ? 'video' : 'document';
+  const type = entry.mimetype || (mediaType === 'audio' ? 'audio/ogg' : 'application/octet-stream');
+  const extension = mediaType === 'audio' ? (type.includes('mp4') ? 'm4a' : 'ogg') :
+    mediaType === 'image' ? (type.includes('png') ? 'png' : 'jpg') : mediaType === 'video' ? 'mp4' : 'bin';
+  const name = String(entry.fileName || `${mediaType}-${Date.now()}.${extension}`).replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100);
+  try {
+    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+      logger: pino({ level: 'silent' }),
+      reuploadRequest: sock?.updateMediaMessage?.bind(sock)
+    });
+    if (!buffer?.length || buffer.length > 20 * 1024 * 1024) {
+      console.error('Adjunto no guardado: vacío o supera 20 MB');
+      return null;
+    }
+    const path = `whatsapp/${jid.split('@')[0]}/${randomUUID()}-${name}`;
+    const { error } = await mediaDb.storage.from('chat-media').upload(path, buffer, { contentType: type });
+    if (error) throw error;
+    return { media_path: path, media_type: mediaType, media_name: name, media_mime: type };
+  } catch (err) {
+    console.error('Error guardando adjunto WhatsApp:', err.message);
+    return null;
+  }
+}
+async function saveMessageInCRM({ rawJid, name, text, fromMe, media = null }) {
   const digits = rawJid.split('@')[0].replace(/\D/g, '');
   const phone = `+${digits}`;
   const { data: existing, error: lookupError } = await supabase.from('contacts')
@@ -107,7 +140,7 @@ async function saveMessageInCRM({ rawJid, name, text, fromMe }) {
     contact = data;
   }
   const { error: insertError } = await supabase.from('messages').insert([{
-    contact_id: contact.id, sender: fromMe ? 'me' : 'client', text
+    contact_id: contact.id, sender: fromMe ? 'me' : 'client', text, ...(media || {})
   }]);
   if (insertError) throw insertError;
   const { error: updateError } = await supabase.from('contacts').update({
@@ -302,9 +335,10 @@ async function connectToWhatsApp() {
             if (msg.key.id) remember(seenEvents, messageId);
             continue;
           }
+          const media = await storeWhatsAppMedia(msg, body, rawJid);
           const name = msg.pushName || `+${rawJid.split('@')[0]}`;
           // Registrar antes de responder. Los propios NUNCA activan a Sol.
-          const contact = await saveMessageInCRM({ rawJid, name, text, fromMe });
+          const contact = await saveMessageInCRM({ rawJid, name, text, fromMe, media });
           if (msg.key.id) remember(seenEvents, messageId);
           console.log(`${fromMe ? '📤 Celular' : '📩 Cliente'}: ${name}: ${text.slice(0, 120)}`);
           if (fromMe || !contact || contact.bot_active === false) continue;
@@ -364,56 +398,57 @@ app.get('/qr', (req, res) => {
 
 // Endpoint para envíos manuales
 async function handleSend(req, res) {
-  const { phone, jid, message, imageUrl } = req.body;
-
-  if ((!phone && !jid) || !sock) {
-    return res.status(400).json({ error: 'Faltan parámetros o WhatsApp desconectado' });
+  const { phone, jid, message, imageUrl, mediaUrl, mediaPath, mediaType, mediaName, mimeType, contactId } = req.body || {};
+  if ((!phone && !jid) || !sock) return res.status(400).json({ error: 'WhatsApp desconectado o falta contacto' });
+  if (mediaUrl && (!process.env.INTERNAL_MEDIA_SECRET || req.headers['x-media-secret'] !== process.env.INTERNAL_MEDIA_SECRET)) {
+    return res.status(403).json({ error: 'Envío multimedia no autorizado' });
   }
-
   try {
-    let targetJid = jid;
-    if (!targetJid) {
-      const cleanDigits = phone.replace(/[^0-9]/g, '');
-      targetJid = `${cleanDigits}@s.whatsapp.net`;
-    }
-
-    if (imageUrl) {
-      const sent = await sock.sendMessage(targetJid, { image: { url: imageUrl }, caption: message || '' });
-      markServerSent(sent, targetJid, message || '📷 Imagen enviada');
-    } else {
-      const sent = await sock.sendMessage(targetJid, { text: message });
-      markServerSent(sent, targetJid, message);
-    }
-
-    try {
-      const cleanPhone = targetJid.replace(/\D/g, '');
-      const displayPhone = `+${cleanPhone}`;
-      const { data: contact } = await supabase
-        .from('contacts')
-        .select('id')
-        .or(`jid.eq.${targetJid},phone.eq.${displayPhone}`)
-        .maybeSingle();
-
-      if (contact) {
-        await supabase.from('messages').insert([{
-          contact_id: contact.id,
-          sender: 'me',
-          text: message || (imageUrl ? '📷 Imagen enviada' : '')
-        }]);
-
-        await supabase.from('contacts').update({
-          last_message: message || (imageUrl ? '📷 Imagen enviada' : ''),
-          updated_at: new Date().toISOString()
-        }).eq('id', contact.id);
+    const targetJid = jid || `${String(phone).replace(/\D/g, '')}@s.whatsapp.net`;
+    let payload;
+    let label = String(message || '').trim();
+    if (mediaUrl) {
+      const host = new URL(mediaUrl).hostname;
+      if (host !== new URL(supabaseUrl).hostname) return res.status(400).json({ error: 'Origen multimedia no permitido' });
+      if (!['image', 'video', 'audio', 'document'].includes(mediaType) || !mediaPath) {
+        return res.status(400).json({ error: 'Multimedia inválida' });
       }
-    } catch (dbSaveErr) {
-      console.error('Aviso Supabase envío manual:', dbSaveErr.message);
+      if (mediaType === 'image') payload = { image: { url: mediaUrl }, caption: label };
+      if (mediaType === 'video') payload = { video: { url: mediaUrl }, caption: label };
+      if (mediaType === 'audio') payload = { audio: { url: mediaUrl }, mimetype: mimeType || 'audio/mpeg', ptt: false };
+      if (mediaType === 'document') payload = { document: { url: mediaUrl }, mimetype: mimeType || 'application/octet-stream', fileName: mediaName || 'archivo', caption: label };
+      label = label || `${mediaType === 'audio' ? '🎤' : mediaType === 'image' ? '📷' : mediaType === 'video' ? '🎬' : '📄'} ${mediaName || 'Archivo enviado'}`;
+    } else if (imageUrl) {
+      payload = { image: { url: imageUrl }, caption: label };
+      label = label || '📷 Imagen enviada';
+    } else {
+      if (!label) return res.status(400).json({ error: 'Mensaje vacío' });
+      payload = { text: label };
     }
-
+    const sent = await sock.sendMessage(targetJid, payload);
+    markServerSent(sent, targetJid, label);
+    try {
+      const digits = targetJid.split('@')[0].replace(/\D/g, '');
+      let found = null;
+      if (contactId) {
+        const { data } = await supabase.from('contacts').select('id').eq('id', contactId).maybeSingle();
+        found = data;
+      }
+      if (!found) {
+        const { data } = await supabase.from('contacts').select('id')
+          .or(`jid.eq.${targetJid},phone.eq.+${digits}`).maybeSingle();
+        found = data;
+      }
+      if (found) {
+        const messageData = { contact_id: found.id, sender: 'me', text: label };
+        if (mediaUrl) Object.assign(messageData, { media_path: mediaPath, media_type: mediaType, media_name: mediaName || '', media_mime: mimeType || '' });
+        const { error: messageErr } = await supabase.from('messages').insert([messageData]);
+        if (messageErr) console.error('Error guardando mensaje enviado:', messageErr.message);
+        await supabase.from('contacts').update({ last_message: label, updated_at: new Date().toISOString() }).eq('id', found.id);
+      }
+    } catch (e) { console.error('Advertencia guardando enviado:', e.message); }
     return res.status(200).json({ success: true });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+  } catch (error) { return res.status(500).json({ error: error.message }); }
 }
 
 app.post('/send-message', handleSend);
