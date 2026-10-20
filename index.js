@@ -418,6 +418,8 @@ async function handleSend(req, res) {
       if (mediaType === 'audio') payload = { audio: { url: mediaUrl }, mimetype: mimeType || 'audio/mpeg', ptt: false };
       if (mediaType === 'document') payload = { document: { url: mediaUrl }, mimetype: mimeType || 'application/octet-stream', fileName: mediaName || 'archivo', caption: label };
       label = label || `${mediaType === 'audio' ? '🎤' : mediaType === 'image' ? '📷' : mediaType === 'video' ? '🎬' : '📄'} ${mediaName || 'Archivo enviado'}`;
+    } else if (mediaPath || mediaType) {
+      return res.status(400).json({ error: 'Llegaron datos multimedia incompletos desde Vercel' });
     } else if (imageUrl) {
       payload = { image: { url: imageUrl }, caption: label };
       label = label || '📷 Imagen enviada';
@@ -425,29 +427,43 @@ async function handleSend(req, res) {
       if (!label) return res.status(400).json({ error: 'Mensaje vacío' });
       payload = { text: label };
     }
+    // Usar la credencial privada SOLO para esta operación de persistencia;
+    // mantener sin cambios el adaptador de autenticación WhatsApp.
+    if (!mediaDb) return res.status(503).json({ error: 'Falta SUPABASE_SERVICE_ROLE_KEY en Render' });
+    const digits = targetJid.split('@')[0].replace(/\D/g, '');
+    let found = null;
+    if (contactId) {
+      const { data, error } = await mediaDb.from('contacts').select('id').eq('id', contactId).maybeSingle();
+      if (error) throw new Error(`Buscando contacto: ${error.message}`);
+      found = data;
+    }
+    if (!found) {
+      const { data, error } = await mediaDb.from('contacts').select('id')
+        .or(`jid.eq.${targetJid},phone.eq.+${digits}`).maybeSingle();
+      if (error) throw new Error(`Buscando contacto: ${error.message}`);
+      found = data;
+    }
+    if (!found) return res.status(404).json({ error: 'No se encontró contacto para el adjunto' });
+    console.log(`[MEDIA DEBUG] tipo=${mediaType || 'texto'} adjunto=${!!mediaUrl} contacto=${found.id}`);
     const sent = await sock.sendMessage(targetJid, payload);
+    if (!sent?.key?.id) throw new Error('Baileys no confirmó el ID de envío');
     markServerSent(sent, targetJid, label);
-    try {
-      const digits = targetJid.split('@')[0].replace(/\D/g, '');
-      let found = null;
-      if (contactId) {
-        const { data } = await supabase.from('contacts').select('id').eq('id', contactId).maybeSingle();
-        found = data;
-      }
-      if (!found) {
-        const { data } = await supabase.from('contacts').select('id')
-          .or(`jid.eq.${targetJid},phone.eq.+${digits}`).maybeSingle();
-        found = data;
-      }
-      if (found) {
-        const messageData = { contact_id: found.id, sender: 'me', text: label };
-        if (mediaUrl) Object.assign(messageData, { media_path: mediaPath, media_type: mediaType, media_name: mediaName || '', media_mime: mimeType || '' });
-        const { error: messageErr } = await supabase.from('messages').insert([messageData]);
-        if (messageErr) console.error('Error guardando mensaje enviado:', messageErr.message);
-        await supabase.from('contacts').update({ last_message: label, updated_at: new Date().toISOString() }).eq('id', found.id);
-      }
-    } catch (e) { console.error('Advertencia guardando enviado:', e.message); }
-    return res.status(200).json({ success: true });
+    const messageData = { contact_id: found.id, sender: 'me', text: label };
+    if (mediaUrl) Object.assign(messageData, {
+      media_path: mediaPath, media_type: mediaType,
+      media_name: mediaName || '', media_mime: mimeType || ''
+    });
+    const { error: messageErr } = await mediaDb.from('messages').insert([messageData]);
+    if (messageErr) {
+      console.error('[MEDIA ERROR] Enviado por WhatsApp pero NO registrado en CRM:', messageErr.message);
+      return res.status(502).json({ error: `WhatsApp recibió el envío pero Supabase no lo guardó: ${messageErr.message}` });
+    }
+    const { error: contactErr } = await mediaDb.from('contacts').update({
+      last_message: label, updated_at: new Date().toISOString()
+    }).eq('id', found.id);
+    if (contactErr) console.error('[MEDIA ERROR] Contacto:', contactErr.message);
+    console.log(`[MEDIA OK] tipo=${mediaType || 'texto'} mensaje guardado contacto=${found.id}`);
+    return res.status(200).json({ success: true, messageId: sent.key.id });
   } catch (error) { return res.status(500).json({ error: error.message }); }
 }
 
