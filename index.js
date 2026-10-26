@@ -30,6 +30,8 @@ const AI_EXTRACT_URL = process.env.AI_EXTRACT_URL || 'https://crm-whatsapp-simpl
 
 let sock = null;
 let currentQR = '';
+let groqBackoffUntil = 0;
+const solPendingContacts = new Set();
 
 // Distingue envíos de este servidor de mensajes escritos en el celular.
 const serverSentIds = new Map();
@@ -224,10 +226,11 @@ async function useSupabaseAuthState() {
   };
 }
 
-async function askSolAI(conversationHistory, imageBase64 = null) {
+async function askSolAI(conversationHistory, imageBase64 = null, quoteData = {}) {
+  if (Date.now() < groqBackoffUntil) return null;
   try {
     console.log('🤖 Consultando a Sol AI (multimodal)...');
-    const payload = { conversationHistory };
+    const payload = { conversationHistory: conversationHistory.slice(-10), quoteData };
     if (imageBase64) {
       payload.imageBase64 = imageBase64;
     }
@@ -239,6 +242,14 @@ async function askSolAI(conversationHistory, imageBase64 = null) {
     });
 
     if (!res.ok) {
+      if (res.status === 429) {
+        let detail = {};
+        try { detail = await res.json(); } catch (_) {}
+        const delay = Math.max(10, Math.min(120, Number(detail.retryAfter || res.headers.get('retry-after') || 30)));
+        groqBackoffUntil = Date.now() + delay * 1000;
+        console.warn(`⏳ Groq 429: pausa global de ${delay} segundos; no se enviará una respuesta repetida.`);
+        return null;
+      }
       console.error(`❌ Sol AI respondió con estado ${res.status}`);
       return null;
     }
@@ -344,13 +355,25 @@ async function connectToWhatsApp() {
           if (fromMe || !contact || contact.bot_active === false) continue;
           // El contenido transcrito se incluye como texto y Sol puede interpretarlo.
           if (body.audioMessage && text.includes('transcripción no disponible')) continue;
+          if (solPendingContacts.has(contact.id)) {
+            console.log('⏭️ Sol ya está procesando este contacto; evito respuesta concurrente');
+            continue;
+          }
+          solPendingContacts.add(contact.id);
+          try {
           const { data: recent, error: historyError } = await supabase.from('messages')
             .select('sender,text').eq('contact_id', contact.id)
-            .order('created_at', { ascending: false }).limit(30);
+            .order('created_at', { ascending: false }).limit(10);
           if (historyError) console.error('Error obteniendo historial:', historyError.message);
           const history = recent?.length ? recent.reverse() : [{ sender: 'client', text }];
-          const aiData = await askSolAI(history, imageBase64);
+          const aiData = await askSolAI(history, imageBase64, contact.quote_data || {});
           if (!aiData?.replyMessage) continue;
+          // Evitar eco/repetición exacta de una respuesta anterior.
+          const previousReply = [...history].reverse().find(m => m.sender === 'me')?.text;
+          if (previousReply && previousReply.trim() === aiData.replyMessage.trim()) {
+            console.log('⏭️ Sol repitió su respuesta anterior; envío cancelado');
+            continue;
+          }
           const sent = await sock.sendMessage(rawJid, { text: aiData.replyMessage });
           markServerSent(sent, rawJid, aiData.replyMessage);
           const { error: sentError } = await supabase.from('messages').insert([{
@@ -365,6 +388,7 @@ async function connectToWhatsApp() {
             quote_data: { ...(contact.quote_data || {}), ...extracted },
             ...(aiData.suggestedStatus ? { status: aiData.suggestedStatus } : {})
           }).eq('id', contact.id);
+          } finally { solPendingContacts.delete(contact.id); }
         } catch (error) {
           console.error('❌ Error procesando mensaje WhatsApp:', error.message);
         }
