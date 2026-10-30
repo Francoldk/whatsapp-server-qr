@@ -189,6 +189,20 @@ async function saveMessageInCRM({ rawJid, name, text, fromMe, media = null }) {
     if (error) throw error;
     contact = data;
   }
+  // Mensajes propios: WhatsApp puede emitir append/notify del mismo envío del CRM.
+  // El envío del CRM se guarda por handleSend. Conservamos mensajes nuevos del celular.
+  if (fromMe) {
+    const { data: matching, error: checkError } = await supabase.from('messages')
+      .select('id,created_at').eq('contact_id', contact.id)
+      .eq('sender', 'me').eq('text', text)
+      .order('created_at', { ascending: false }).limit(1);
+    if (checkError) console.warn('[DEDUP] No se pudo verificar mensaje propio:', checkError.message);
+    const prior = matching?.[0];
+    if (prior?.created_at && Date.now() - new Date(prior.created_at).getTime() < 120000) {
+      console.log('[DEDUP] Mensaje propio ya registrado; se evita duplicado en CRM');
+      return contact;
+    }
+  }
   const { error: insertError } = await supabase.from('messages').insert([{
     contact_id: contact.id, sender: fromMe ? 'me' : 'client', text, ...(media || {})
   }]);
@@ -408,6 +422,7 @@ async function connectToWhatsApp() {
           if (!text.trim() && !imageBase64) continue;
           if (fromMe && (remembered(serverSentIds, msg.key.id) || remembered(serverSentTexts, `${rawJid}|${text}`))) {
             if (msg.key.id) remember(seenEvents, messageId);
+            console.log('[DEDUP] Eco de envío desde CRM omitido');
             continue;
           }
           const media = await storeWhatsAppMedia(msg, body, rawJid);
@@ -544,8 +559,18 @@ async function handleSend(req, res) {
     }
     if (!found) return res.status(404).json({ error: 'No se encontró contacto para el adjunto' });
     console.log(`[MEDIA DEBUG] tipo=${mediaType || 'texto'} adjunto=${!!mediaUrl} contacto=${found.id}`);
-    const sent = await sock.sendMessage(targetJid, payload);
-    if (!sent?.key?.id) throw new Error('Baileys no confirmó el ID de envío');
+    // Reservar la huella ANTES del envío: Baileys puede disparar append
+    // mientras sendMessage aún está pendiente, antes de conocer el ID.
+    const sentFingerprint = `${targetJid}|${label}`;
+    if (label) remember(serverSentTexts, sentFingerprint, 120000);
+    let sent;
+    try {
+      sent = await sock.sendMessage(targetJid, payload);
+      if (!sent?.key?.id) throw new Error('Baileys no confirmó el ID de envío');
+    } catch (sendError) {
+      if (label) serverSentTexts.delete(sentFingerprint);
+      throw sendError;
+    }
     markServerSent(sent, targetJid, label);
     const messageData = { contact_id: found.id, sender: 'me', text: label };
     if (mediaUrl) Object.assign(messageData, {
