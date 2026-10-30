@@ -184,7 +184,7 @@ async function saveMessageInCRM({ rawJid, name, text, fromMe, media = null }) {
   if (!contact) {
     const { data, error } = await supabase.from('contacts').insert([{
       name: name || phone, phone, jid: rawJid, status: 'Entrante',
-      last_message: text, bot_active: true
+      last_message: text, bot_active: !fromMe
     }]).select().single();
     if (error) throw error;
     contact = data;
@@ -207,15 +207,23 @@ async function saveMessageInCRM({ rawJid, name, text, fromMe, media = null }) {
     contact_id: contact.id, sender: fromMe ? 'me' : 'client', text, ...(media || {})
   }]);
   if (insertError) throw insertError;
-  const { error: updateError } = await supabase.from('contacts').update({
-    last_message: text, jid: rawJid,
+
+  const updateFields = {
+    last_message: text, 
+    jid: rawJid,
     name: !fromMe && (!contact.name || contact.name === contact.phone) ? name : contact.name,
     updated_at: new Date().toISOString()
-  }).eq('id', contact.id);
-  if (updateError) console.error('Error actualizando contacto:', updateError.message);
-  return contact;
-}
+  };
 
+  // 🛡️ CORRECCIÓN CLAVE: Si el mensaje fue enviado por un humano desde el celu, PAUSAMOS la IA al instante.
+  if (fromMe) {
+    updateFields.bot_active = false;
+  }
+
+  const { error: updateError } = await supabase.from('contacts').update(updateFields).eq('id', contact.id);
+  if (updateError) console.error('Error actualizando contacto:', updateError.message);
+  return { ...contact, ...updateFields };
+}
 
 // Adaptador de autenticación persistente con Supabase
 async function useSupabaseAuthState() {
@@ -428,7 +436,7 @@ async function connectToWhatsApp() {
           }
           const media = await storeWhatsAppMedia(msg, body, rawJid);
           const name = msg.pushName || `+${rawJid.split('@')[0]}`;
-          // Registrar antes de responder. Los propios NUNCA activan a Sol.
+          // Registrar antes de responder.
           const contact = await saveMessageInCRM({ rawJid, name, text, fromMe, media });
           if (msg.key.id) remember(seenEvents, messageId);
           console.log(`${fromMe ? '📤 Celular' : '📩 Cliente'}: ${name}: ${text.slice(0, 120)}`);
