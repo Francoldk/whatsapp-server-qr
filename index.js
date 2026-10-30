@@ -126,6 +126,54 @@ async function storeWhatsAppMedia(msg, body, jid) {
     return null;
   }
 }
+
+// Multimedia de clientes: imagen (visión), PDF digital y PDF escaneado (máximo 3 páginas).
+async function interpretIncomingDocument(msg, body) {
+  const doc = body.documentMessage;
+  if (!doc) return null;
+  const mime = String(doc.mimetype || '').toLowerCase();
+  const name = String(doc.fileName || 'documento');
+  if (!(mime.includes('pdf') || /\.pdf$/i.test(name))) {
+    return { mediaNote: `Documento adjunto: ${name}. Formato no interpretado automáticamente; no afirmar que fue leído.` };
+  }
+  try {
+    const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+      logger: pino({ level: 'silent' }), reuploadRequest: sock?.updateMediaMessage?.bind(sock)
+    });
+    if (!buffer?.length || buffer.length > 8 * 1024 * 1024) {
+      return { mediaNote: 'PDF recibido, demasiado grande o vacío para analizarlo. Solicitar PDF de hasta 8 MB.' };
+    }
+    let documentText = '';
+    try {
+      const parsePdf = require('pdf-parse');
+      const result = await parsePdf(buffer);
+      documentText = String(result.text || '').trim().slice(0, 14000);
+    } catch(e) { console.warn('[MEDIA] Extracción texto PDF:', e.message); }
+    // Escaneos, documentos mixtos o sin capa de texto: páginas como imágenes a Qwen.
+    let imagesBase64 = [];
+    if (documentText.length < 300) {
+      try {
+        const { pdf } = await import('pdf-to-img');
+        const pdfDoc = await pdf(`data:application/pdf;base64,${buffer.toString('base64')}`, { scale: 1.15, format: 'jpg' });
+        try {
+          for (let page = 1; page <= Math.min(pdfDoc.length, 3); page++) {
+            const image = Buffer.from(await pdfDoc.getPage(page));
+            if (image.length <= 700 * 1024) imagesBase64.push({ base64: image.toString('base64'), mimeType: 'image/jpeg' });
+          }
+        } finally { await pdfDoc.destroy(); }
+      } catch(e) { console.error('[MEDIA] OCR PDF escaneado no disponible:', e.message); }
+    }
+    if (!documentText && !imagesBase64.length) {
+      return { mediaNote: `PDF ${name} recibido, pero no fue posible leerlo; pedir una imagen nítida o los datos manualmente.` };
+    }
+    console.log(`[MEDIA] PDF leído: ${name}; texto=${documentText.length} caracteres; páginas visuales=${imagesBase64.length}`);
+    return { documentText, imagesBase64, mediaNote: `Invoice/PDF ${name}; páginas convertidas: ${imagesBase64.length}; si hay más páginas, aclarar que solo se analizaron las primeras tres.` };
+  } catch (e) {
+    console.error('[MEDIA] Error leyendo PDF:', e.message);
+    return { mediaNote: 'PDF recibido pero no se pudo descargar para interpretarlo.' };
+  }
+}
+
 async function saveMessageInCRM({ rawJid, name, text, fromMe, media = null }) {
   const digits = rawJid.split('@')[0].replace(/\D/g, '');
   const phone = `+${digits}`;
@@ -226,14 +274,14 @@ async function useSupabaseAuthState() {
   };
 }
 
-async function askSolAI(conversationHistory, imageBase64 = null, quoteData = {}) {
+async function askSolAI(conversationHistory, imageBase64 = null, quoteData = {}, extraMedia = {}) {
   if (Date.now() < groqBackoffUntil) {
     console.warn(`[SOL] Espera por límite de Groq: ${Math.ceil((groqBackoffUntil - Date.now()) / 1000)} segundos`);
     return null;
   }
   try {
     console.log('🤖 Consultando a Sol AI (multimodal)...');
-    const payload = { conversationHistory: conversationHistory.slice(-10), quoteData };
+    const payload = { conversationHistory: conversationHistory.slice(-10), quoteData, ...extraMedia };
     if (imageBase64) {
       payload.imageBase64 = imageBase64;
     }
@@ -342,7 +390,10 @@ async function connectToWhatsApp() {
                   logger: pino({ level: 'silent' }),
                   reuploadRequest: sock?.updateMediaMessage?.bind(sock)
                 });
-                imageBase64 = buffer.toString('base64');
+                if (buffer.length <= 2 * 1024 * 1024) {
+                   imageBase64 = buffer.toString('base64');
+                   mediaForSol.imageMime = body.imageMessage.mimetype?.startsWith('image/') ? body.imageMessage.mimetype : 'image/jpeg';
+                 } else { mediaForSol.mediaNote = 'Imagen demasiado grande para análisis visual, no asegurar que fue leída.'; }
               } catch (e) {
                 console.error('Error descargando imagen:', e.message);
               }
@@ -350,6 +401,7 @@ async function connectToWhatsApp() {
             text = text || (fromMe ? '📷 Imagen enviada' : '📷 Imagen recibida');
           } else if (body.documentMessage) {
             text = text || `📄 Documento: ${body.documentMessage.fileName || 'archivo'}`;
+             if (!fromMe) mediaForSol = await interpretIncomingDocument(msg, body) || {};
           } else if (body.videoMessage) {
             text = text || (fromMe ? '🎬 Video enviado' : '🎬 Video recibido');
           }
@@ -384,7 +436,7 @@ async function connectToWhatsApp() {
             .order('created_at', { ascending: false }).limit(10);
           if (historyError) console.error('Error obteniendo historial:', historyError.message);
           const history = recent?.length ? recent.reverse() : [{ sender: 'client', text }];
-          const aiData = await askSolAI(history, imageBase64, contact.quote_data || {});
+          const aiData = await askSolAI(history, imageBase64, contact.quote_data || {}, mediaForSol);
           if (!aiData?.replyMessage) {
             console.warn(`[SOL] La API no devolvió texto para contacto ${contact.id}; revisá los registros anteriores`);
             continue;
