@@ -392,6 +392,7 @@ async function connectToWhatsApp() {
           }
           const body = unwrapMessage(msg);
           let imageBase64 = null;
+          let mediaForSol = {}; // Estado multimedia por mensaje; evita ReferenceError y conserva OCR/PDF.
           let text = body.conversation || body.extendedTextMessage?.text ||
             body.imageMessage?.caption || body.documentMessage?.caption || '';
           if (body.audioMessage) {
