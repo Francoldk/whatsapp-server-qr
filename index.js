@@ -23,6 +23,7 @@ const supabaseUrl = process.env.SUPABASE_URL || 'https://jcnsepbalxyscxrsyade.su
 const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_kVLvltX-K4yGF2VRPaGDaA_KBkmT78W';
 const supabase = createClient(supabaseUrl, supabaseKey);
 const mediaDb = process.env.SUPABASE_SERVICE_ROLE_KEY ? createClient(supabaseUrl, process.env.SUPABASE_SERVICE_ROLE_KEY) : null;
+require('./audio-compatible').registerAudioCompatible(app, { db: mediaDb, secret: process.env.SUPABASE_SERVICE_ROLE_KEY });
 const { randomUUID } = require('crypto');
 
 // URL de producción en Vercel
@@ -605,3 +606,4 @@ app.post('/send', handleSend);
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+
